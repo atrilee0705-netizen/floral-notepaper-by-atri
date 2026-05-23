@@ -25,3 +25,11 @@ export function toggleTileWindow(noteId: string, bounds?: WindowBounds): Promise
 export function openNoteInEditor(noteId: string): Promise<void> {
   return invoke("open_note_in_editor", { noteId });
 }
+
+export function openMainWindow(): Promise<void> {
+  return invoke("open_main_window");
+}
+
+export function openReminderAlarmWindow(reminderId: string): Promise<string> {
+  return invoke("open_reminder_alarm_window", { reminderId });
+}

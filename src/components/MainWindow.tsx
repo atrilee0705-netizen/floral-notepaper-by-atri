@@ -14,6 +14,8 @@ import {
 import type { AppConfig, ViewMode } from "../features/settings/types";
 import { normalizeTileColor } from "../features/settings/tileColor";
 import { BackgroundLayer } from "./BackgroundLayer";
+import { ReminderCountdownBadge } from "./ReminderCountdownBadge";
+import { ReminderPanel } from "./ReminderPanel";
 import { SettingsPanel } from "./SettingsPanel";
 import { SlidingButtonGroup } from "./SlidingButtonGroup";
 import {
@@ -47,7 +49,11 @@ import {
   getNoteContextMenuItems,
   type NoteContextMenuAction,
 } from "../features/notes/noteContextMenu";
-import { openNotepadWindow, toggleTileWindow } from "../features/windows/api";
+import {
+  openNotepadWindow,
+  openReminderAlarmWindow,
+  toggleTileWindow,
+} from "../features/windows/api";
 import {
   closeCurrentWindow,
   minimizeCurrentWindow,
@@ -60,6 +66,28 @@ import {
   TILE_WINDOW_UNPINNED_EVENT,
   syncPinnedTileIds,
 } from "../features/windows/tileWindowEvents";
+import type { BoundReminderNote, Reminder } from "../features/reminders/types";
+import {
+  deleteReminder,
+  getReminderSurfaceMode,
+  loadReminders,
+  REMINDERS_CHANGED_EVENT,
+  saveReminders,
+  upsertReminder,
+} from "../features/reminders/storage";
+import {
+  collectDueReminders,
+  completeReminder,
+  REMINDER_CHECK_INTERVAL_MS,
+  snoozeReminder,
+} from "../features/reminders/scheduler";
+import { playReminderSound, stopReminderSound } from "../features/reminders/sound";
+import { showReminderNotification } from "../features/reminders/notifications";
+import {
+  formatRemainingTime,
+  getActiveReminderForNote,
+  remainingSeconds,
+} from "../features/reminders/countdown";
 
 type SaveState = "idle" | "dirty" | "saving" | "saved" | "error";
 
@@ -295,6 +323,9 @@ export function MainWindow({
   const [noteMenu, setNoteMenu] = useState<NoteMenuState | null>(null);
   const [noteMenuClosing, setNoteMenuClosing] = useState(false);
   const [settingsOpen, setSettingsOpen] = useState(initialSettingsOpen);
+  const [reminderPanelOpen, setReminderPanelOpen] = useState(false);
+  const [reminders, setReminders] = useState<Reminder[]>([]);
+  const [reminderNow, setReminderNow] = useState(Date.now());
   const [settingsConfig, setSettingsConfig] = useState<AppConfig | null>(initialConfig ?? null);
   const [savedNotesDir, setSavedNotesDir] = useState<string | null>(
     initialConfig?.notesDir ?? null,
@@ -337,6 +368,25 @@ export function MainWindow({
     () => externalFiles.find((f) => f.id === selectedId) ?? null,
     [externalFiles, selectedId],
   );
+
+  const boundReminderNote = useMemo<BoundReminderNote | null>(() => {
+    if (!selectedNote || selectedExternalFile) return null;
+    return {
+      id: selectedNote.id,
+      title:
+        selectedNote.title.trim() ||
+        selectedNote.preview.trim() ||
+        t("common.untitledNote", { defaultValue: "无标题笔记" }),
+    };
+  }, [selectedExternalFile, selectedNote, t]);
+
+  const activeNoteReminder = useMemo(
+    () => getActiveReminderForNote(reminders, boundReminderNote?.id ?? null, reminderNow),
+    [boundReminderNote?.id, reminderNow, reminders],
+  );
+  const activeNoteReminderText = activeNoteReminder
+    ? formatRemainingTime(remainingSeconds(activeNoteReminder.remindAt, reminderNow))
+    : null;
 
   const isExternal = selectedExternalFile !== null;
 
@@ -626,6 +676,16 @@ export function MainWindow({
   }, [loadNote]);
 
   useEffect(() => {
+    const unlisten = listen("open-reminder-panel", () => {
+      setReminderPanelOpen(true);
+      setReminders(loadReminders());
+    });
+    return () => {
+      void unlisten.then((fn) => fn());
+    };
+  }, []);
+
+  useEffect(() => {
     const unlisten = listen<string>("shortcut-register-failed", (event) => {
       setErrorMessage(event.payload);
     });
@@ -651,6 +711,79 @@ export function MainWindow({
       void unlisten.then((fn) => fn());
     };
   }, []);
+
+  const processReminderSnapshot = useCallback((source: Reminder[]) => {
+    const { due, reminders: nextReminders } = collectDueReminders(source);
+    if (due.length > 0) {
+      due.forEach((item) => {
+        void showReminderNotification(item);
+        if (!getReminderSurfaceMode(item.reminder.noteId)) {
+          void openReminderAlarmWindow(item.reminder.id);
+        }
+      });
+      void playReminderSound(due[0].reminder);
+    }
+    saveReminders(nextReminders);
+    setReminders(nextReminders);
+  }, []);
+
+  useEffect(() => {
+    setReminderNow(Date.now());
+    processReminderSnapshot(loadReminders());
+    const interval = window.setInterval(() => {
+      setReminderNow(Date.now());
+      processReminderSnapshot(loadReminders());
+    }, REMINDER_CHECK_INTERVAL_MS);
+    return () => {
+      window.clearInterval(interval);
+      void stopReminderSound();
+    };
+  }, [processReminderSnapshot]);
+
+  useEffect(() => {
+    const refresh = () => setReminders(loadReminders());
+    const handleStorage = (event: StorageEvent) => {
+      if (event.key === "floral-notepaper.reminders") refresh();
+    };
+    window.addEventListener(REMINDERS_CHANGED_EVENT, refresh);
+    window.addEventListener("storage", handleStorage);
+    const unlisten = listen("reminders-changed", refresh);
+    return () => {
+      window.removeEventListener(REMINDERS_CHANGED_EVENT, refresh);
+      window.removeEventListener("storage", handleStorage);
+      void unlisten.then((fn) => fn());
+    };
+  }, []);
+
+  const handleCreateReminder = useCallback((reminder: Reminder) => {
+    setReminders(upsertReminder(reminder));
+  }, []);
+
+  const handleDeleteReminder = useCallback((id: string) => {
+    void stopReminderSound();
+    setReminders(deleteReminder(id));
+  }, []);
+
+  const handleCompleteReminder = useCallback((id: string) => {
+    void stopReminderSound();
+    const next = completeReminder(loadReminders(), id);
+    saveReminders(next);
+    setReminders(next);
+  }, []);
+
+  const handleSnoozeReminder = useCallback((reminder: Reminder) => {
+    void stopReminderSound();
+    const next = snoozeReminder(loadReminders(), reminder, 5);
+    saveReminders(next);
+    setReminders(next);
+  }, []);
+
+  const handleOpenReminderNote = useCallback(
+    (noteId: string) => {
+      void loadNote(noteId).then(() => setReminderPanelOpen(false));
+    },
+    [loadNote],
+  );
 
   useEffect(() => {
     if (!selectedExternalFile) return;
@@ -1270,6 +1403,32 @@ export function MainWindow({
               >
                 <path d="M4 4h16v14H7l-3 3V4z" />
                 <path d="M8 9h8M8 13h5" />
+              </svg>
+            </button>
+            <button
+              onClick={() => {
+                setReminderPanelOpen((open) => !open);
+                setReminders(loadReminders());
+              }}
+              className={`w-10 h-11 flex items-center justify-center transition-all cursor-pointer ${
+                reminderPanelOpen
+                  ? "text-bamboo bg-bamboo-mist/50"
+                  : "text-ink-ghost hover:text-bamboo hover:bg-bamboo-mist/50"
+              }`}
+              title="提醒中心"
+            >
+              <svg
+                width="14"
+                height="14"
+                viewBox="0 0 24 24"
+                fill="none"
+                stroke="currentColor"
+                strokeWidth="2"
+                strokeLinecap="round"
+                strokeLinejoin="round"
+              >
+                <path d="M18 8a6 6 0 1 0-12 0c0 7-3 7-3 9h18c0-2-3-2-3-9" />
+                <path d="M13.73 21a2 2 0 0 1-3.46 0" />
               </svg>
             </button>
             <button
@@ -2038,23 +2197,31 @@ export function MainWindow({
               key={noteTransitionKey}
               className="animate-note-enter px-6 pt-4 pb-2 shrink-0 border-b border-paper-deep/15"
             >
-              <input
-                type="text"
-                value={title}
-                onChange={(event) => {
-                  setTitle(event.target.value);
-                  markDirty();
-                }}
-                onKeyDown={(event) => {
-                  if (event.key === "Enter") {
-                    event.preventDefault();
-                    contentRef.current?.focus();
-                  }
-                }}
-                placeholder={t("common.untitledNote", { defaultValue: "无标题笔记" })}
-                disabled={!selectedId}
-                className="w-full text-[20px] font-display font-bold text-ink placeholder:text-ink-ghost/50 tracking-wide disabled:opacity-60"
-              />
+              <div className="flex items-center gap-2 min-w-0">
+                <input
+                  type="text"
+                  value={title}
+                  onChange={(event) => {
+                    setTitle(event.target.value);
+                    markDirty();
+                  }}
+                  onKeyDown={(event) => {
+                    if (event.key === "Enter") {
+                      event.preventDefault();
+                      contentRef.current?.focus();
+                    }
+                  }}
+                  placeholder={t("common.untitledNote", { defaultValue: "无标题笔记" })}
+                  disabled={!selectedId}
+                  className="min-w-0 flex-1 text-[20px] font-display font-bold text-ink placeholder:text-ink-ghost/50 tracking-wide disabled:opacity-60"
+                />
+                {activeNoteReminderText && (
+                  <ReminderCountdownBadge
+                    value={activeNoteReminderText}
+                    className="mt-0.5 shrink-0"
+                  />
+                )}
+              </div>
               <div className="flex items-center gap-3 mt-1.5">
                 <span className="text-[10px] text-ink-ghost font-mono tabular-nums truncate max-w-[200px]">
                   {selectedExternalFile
@@ -2231,6 +2398,24 @@ export function MainWindow({
               </div>
             </div>
           )}
+          <div
+            className={`relative shrink-0 transition-all duration-[600ms] overflow-hidden h-full ${
+              reminderPanelOpen ? "w-[340px]" : "w-0"
+            }`}
+          >
+            <div className="w-[340px] h-full">
+              <ReminderPanel
+                reminders={reminders}
+                boundNote={boundReminderNote}
+                onCreate={handleCreateReminder}
+                onDelete={handleDeleteReminder}
+                onComplete={handleCompleteReminder}
+                onSnooze={handleSnoozeReminder}
+                onOpenNote={handleOpenReminderNote}
+                onClose={() => setReminderPanelOpen(false)}
+              />
+            </div>
+          </div>
         </div>
       </div>
       {noteMenu && noteMenuTarget && (

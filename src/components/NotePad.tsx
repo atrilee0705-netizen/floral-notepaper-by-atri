@@ -10,7 +10,7 @@ import {
   getDisplayTitle,
   metadataFromNote,
 } from "../features/notes/noteUtils";
-import { listen } from "@tauri-apps/api/event";
+import { emit, listen } from "@tauri-apps/api/event";
 import { getCurrentWindow } from "@tauri-apps/api/window";
 import {
   animateCurrentWindowBounds,
@@ -22,7 +22,7 @@ import {
   startCurrentWindowDrag,
   startCurrentWindowResize,
 } from "../features/windows/controls";
-import { openNoteInEditor } from "../features/windows/api";
+import { openMainWindow, openNoteInEditor } from "../features/windows/api";
 import type { ResizeDirection } from "../features/windows/controls";
 import { getConfig } from "../features/settings/api";
 import {
@@ -48,6 +48,28 @@ import {
 } from "../features/windows/tileWindowEvents";
 import { BackgroundLayer } from "./BackgroundLayer";
 import { Tile } from "./Tile";
+import { ReminderAlert } from "./ReminderAlert";
+import { ReminderCountdownBadge } from "./ReminderCountdownBadge";
+import type { DueReminder, Reminder } from "../features/reminders/types";
+import {
+  clearReminderSurfaceMode,
+  loadReminders,
+  REMINDERS_CHANGED_EVENT,
+  saveReminders,
+  setReminderSurfaceMode,
+} from "../features/reminders/storage";
+import {
+  collectDueReminders,
+  completeReminder,
+  snoozeReminder,
+} from "../features/reminders/scheduler";
+import {
+  formatRemainingTime,
+  getActiveReminderForNote,
+  remainingSeconds,
+} from "../features/reminders/countdown";
+import { showReminderNotification } from "../features/reminders/notifications";
+import { playReminderSound, stopReminderSound } from "../features/reminders/sound";
 
 type OpenMode = "new" | "open";
 type NotePadStatus = "empty" | "opened" | "saved" | "dirty" | "saveFailed" | "copied";
@@ -131,6 +153,8 @@ export function NotePad({
   const [tileColor, setTileColor] = useState(() =>
     resolveTileColor("system", normalizeTileColor(initialTileColor)),
   );
+  const [reminders, setReminders] = useState<Reminder[]>([]);
+  const [now, setNow] = useState(Date.now());
   const [isExiting, setIsExiting] = useState(false);
   const titleRef = useRef<HTMLInputElement>(null);
   const contentRef = useRef<HTMLTextAreaElement>(null);
@@ -139,6 +163,7 @@ export function NotePad({
       new URLSearchParams(window.location.search).get("standby") === "1",
   );
   const hasEnteredOnce = useRef(false);
+  const reminderNoteIdRef = useRef<string | null>(initialNoteId ?? null);
   const statusLabel = useMemo<Record<NotePadStatus, string>>(
     () => ({
       empty: t("notepad.status.empty", { defaultValue: "空" }),
@@ -158,6 +183,29 @@ export function NotePad({
     }),
     [t],
   );
+
+  const activeCountdown = getActiveReminderForNote(reminders, editingNoteId, now);
+  const countdownText = activeCountdown
+    ? formatRemainingTime(remainingSeconds(activeCountdown.remindAt, now))
+    : null;
+  const dueReminder: DueReminder | null =
+    activeCountdown && new Date(activeCountdown.remindAt).getTime() <= now
+      ? {
+          reminder: activeCountdown,
+          missed: now - new Date(activeCountdown.remindAt).getTime() > 30_000,
+        }
+      : null;
+
+  useEffect(() => {
+    reminderNoteIdRef.current = editingNoteId ?? initialNoteId ?? null;
+  }, [editingNoteId, initialNoteId]);
+
+  useEffect(() => {
+    const noteId = editingNoteId ?? initialNoteId ?? null;
+    if (!noteId || isStandby.current) return;
+    setReminderSurfaceMode(noteId, surfaceMode === "tile" ? "tile" : "notepad");
+    return () => clearReminderSurfaceMode(noteId);
+  }, [editingNoteId, initialNoteId, surfaceMode]);
 
   const refreshNotes = useCallback(async () => {
     const loadedNotes = await listNotes();
@@ -213,6 +261,69 @@ export function NotePad({
       void unlisten.then((fn) => fn());
     };
   }, [refreshNotes]);
+
+  useEffect(() => {
+    setReminders(loadReminders());
+    const interval = window.setInterval(() => {
+      setNow(Date.now());
+      if (isStandby.current) return;
+
+      const currentNoteId = reminderNoteIdRef.current;
+      if (!currentNoteId) return;
+
+      const { due, reminders: scopedReminders } = collectDueReminders(
+        loadReminders().filter((reminder) => reminder.noteId === currentNoteId),
+      );
+
+      if (due.length > 0) {
+        const scopedById = new Map(scopedReminders.map((reminder) => [reminder.id, reminder]));
+        const mergedReminders = loadReminders().map(
+          (reminder) => scopedById.get(reminder.id) ?? reminder,
+        );
+        saveReminders(mergedReminders);
+        due.forEach((item) => {
+          void showReminderNotification(item);
+        });
+        void playReminderSound(due[0].reminder);
+      }
+
+      setReminders(loadReminders());
+    }, 1000);
+
+    return () => {
+      window.clearInterval(interval);
+      void stopReminderSound();
+    };
+  }, []);
+
+  useEffect(() => {
+    const refresh = () => setReminders(loadReminders());
+    const handleStorage = (event: StorageEvent) => {
+      if (event.key === "floral-notepaper.reminders") refresh();
+    };
+    window.addEventListener(REMINDERS_CHANGED_EVENT, refresh);
+    window.addEventListener("storage", handleStorage);
+    const unlisten = listen("reminders-changed", refresh);
+    return () => {
+      window.removeEventListener(REMINDERS_CHANGED_EVENT, refresh);
+      window.removeEventListener("storage", handleStorage);
+      void unlisten.then((fn) => fn());
+    };
+  }, []);
+
+  const handleCompleteReminder = useCallback((id: string) => {
+    void stopReminderSound();
+    const next = completeReminder(loadReminders(), id);
+    saveReminders(next);
+    setReminders(next);
+  }, []);
+
+  const handleSnoozeReminder = useCallback((reminder: Reminder) => {
+    void stopReminderSound();
+    const next = snoozeReminder(loadReminders(), reminder, 5);
+    saveReminders(next);
+    setReminders(next);
+  }, []);
 
   useEffect(() => {
     if (isStandby.current) return;
@@ -399,6 +510,20 @@ export function NotePad({
     }
   };
 
+  const handleOpenReminderCenter = useCallback(async () => {
+    setErrorMessage(null);
+    try {
+      if (editingNoteId) {
+        await openNoteInEditor(editingNoteId);
+      } else {
+        await openMainWindow();
+      }
+      await emit("open-reminder-panel", editingNoteId ?? null);
+    } catch (error) {
+      setErrorMessage(getErrorMessage(error));
+    }
+  }, [editingNoteId]);
+
   const handlePin = async () => {
     setErrorMessage(null);
     try {
@@ -412,6 +537,8 @@ export function NotePad({
   };
 
   const handleClose = useCallback(() => {
+    clearReminderSurfaceMode(reminderNoteIdRef.current);
+    void stopReminderSound();
     setIsExiting(true);
     const closeSurface = surfaceMode === "tile" ? closeCurrentWindow : recycleCurrentNotepad;
     void closeSurface().catch((error) => {
@@ -478,7 +605,8 @@ export function NotePad({
 
   const handleDrag = (event: MouseEvent<HTMLElement>) => {
     const target = event.target as HTMLElement;
-    if (target.closest("button,input,textarea")) return;
+    if (target.closest("button,input,textarea,[data-reminder-panel],[data-reminder-action]"))
+      return;
     void startCurrentWindowDrag().catch(() => undefined);
   };
 
@@ -520,6 +648,64 @@ export function NotePad({
           data-note-id={tileNoteId}
           onMouseDown={handleDrag}
         >
+          {dueReminder ? (
+            <div
+              data-reminder-action="true"
+              className="absolute inset-x-3 top-3 z-50 rounded-lg border border-paper-deep/35 bg-cloud/95 px-3 py-2.5 shadow-[0_8px_22px_rgba(26,26,24,0.14)] pointer-events-auto"
+              onPointerDown={(event) => {
+                event.preventDefault();
+                event.stopPropagation();
+              }}
+              onMouseDown={(event) => {
+                event.preventDefault();
+                event.stopPropagation();
+              }}
+            >
+              <div className="flex items-center gap-1.5 text-[11px] font-mono text-bamboo tabular-nums">
+                <span aria-hidden="true">⏰</span>
+                <span className="min-w-0 truncate">
+                  {dueReminder.reminder.noteTitle?.trim() ||
+                    tileTitle ||
+                    countdownText ||
+                    "00:00:00"}
+                </span>
+              </div>
+              <div className="mt-1.5 flex items-center justify-end gap-1.5">
+                <button
+                  type="button"
+                  data-reminder-action="true"
+                  onPointerDown={(event) => event.stopPropagation()}
+                  onMouseDown={(event) => event.stopPropagation()}
+                  onClick={(event) => {
+                    event.preventDefault();
+                    event.stopPropagation();
+                    handleSnoozeReminder(dueReminder.reminder);
+                  }}
+                  className="h-8 min-w-12 px-2.5 flex items-center justify-center rounded-md border border-paper-deep/40 text-[11px] text-ink-faint hover:text-ink-soft hover:bg-paper-warm cursor-pointer select-none"
+                >
+                  {t("reminders.action.snoozeShort", { defaultValue: "稍后" })}
+                </button>
+                <button
+                  type="button"
+                  data-reminder-action="true"
+                  onPointerDown={(event) => event.stopPropagation()}
+                  onMouseDown={(event) => event.stopPropagation()}
+                  onClick={(event) => {
+                    event.preventDefault();
+                    event.stopPropagation();
+                    handleCompleteReminder(dueReminder.reminder.id);
+                  }}
+                  className="h-8 min-w-12 px-2.5 flex items-center justify-center rounded-md bg-bamboo text-[11px] text-cloud hover:bg-bamboo-light cursor-pointer select-none"
+                >
+                  {t("common.done", { defaultValue: "完成" })}
+                </button>
+              </div>
+            </div>
+          ) : countdownText ? (
+            <div className="absolute right-3 top-3 z-20">
+              <ReminderCountdownBadge value={countdownText} className="bg-cloud/85" />
+            </div>
+          ) : null}
           <button
             type="button"
             aria-label="取消钉屏"
@@ -579,6 +765,26 @@ export function NotePad({
               </div>
 
               <div className="flex items-center gap-1.5">
+                {countdownText && <ReminderCountdownBadge value={countdownText} />}
+                <button
+                  onClick={() => void handleOpenReminderCenter()}
+                  className="group w-7 h-7 flex items-center justify-center rounded-lg transition-all duration-200 cursor-pointer text-ink-ghost hover:text-bamboo hover:bg-bamboo-mist/50"
+                  title={t("reminders.panel.title", { defaultValue: "提醒中心" })}
+                >
+                  <svg
+                    width="14"
+                    height="14"
+                    viewBox="0 0 24 24"
+                    fill="none"
+                    stroke="currentColor"
+                    strokeWidth="2"
+                    strokeLinecap="round"
+                    strokeLinejoin="round"
+                  >
+                    <path d="M6 8a6 6 0 0 1 12 0c0 7 3 7 3 9H3c0-2 3-2 3-9" />
+                    <path d="M10 21h4" />
+                  </svg>
+                </button>
                 <button
                   onClick={() => void handlePin()}
                   className="group w-7 h-7 flex items-center justify-center rounded-lg transition-all duration-200 cursor-pointer text-ink-ghost hover:text-ink-faint hover:bg-paper-warm"
@@ -753,6 +959,16 @@ export function NotePad({
               </div>
             )}
           </>
+          {dueReminder && (
+            <ReminderAlert
+              due={dueReminder}
+              inline
+              compact
+              onComplete={() => handleCompleteReminder(dueReminder.reminder.id)}
+              onSnooze={() => handleSnoozeReminder(dueReminder.reminder)}
+              onOpenNote={() => void handleOpenReminderCenter()}
+            />
+          )}
           <SurfaceResizeHandles />
         </div>
       )}

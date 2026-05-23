@@ -570,6 +570,13 @@ pub async fn toggle_tile_window(
     toggle_tile_window_now(&app, &note_id, bounds)
 }
 
+pub async fn open_reminder_alarm_window(
+    app: AppHandle,
+    reminder_id: String,
+) -> Result<String, AppError> {
+    open_reminder_alarm_window_now(&app, &reminder_id)
+}
+
 pub fn extract_file_arg(args: &[String]) -> Option<String> {
     args.iter()
         .find(|arg| {
@@ -1038,6 +1045,40 @@ fn toggle_tile_window_now(
 
     open_tile_window_now(app, note_id, bounds)?;
     Ok(true)
+}
+
+fn open_reminder_alarm_window_now(app: &AppHandle, reminder_id: &str) -> Result<String, AppError> {
+    let label = format!("reminder-alarm-{}", sanitize_label_part(reminder_id));
+    let url = format!("index.html?view=reminder&reminderId={reminder_id}");
+
+    let label = open_or_focus_window(
+        app,
+        &label,
+        WindowOpenOptions {
+            url,
+            title: "提醒时间到了".to_string(),
+            specs: WindowSizeSpec {
+                width: 420.0,
+                height: 260.0,
+                min_width: 360.0,
+                min_height: 220.0,
+            },
+            decorations: false,
+            always_on_top: true,
+            shadow: true,
+            skip_taskbar: false,
+            bounds: None,
+        },
+    )?;
+
+    if let Some(window) = app.get_webview_window(&label) {
+        let _ = window.center();
+        let _ = window.set_always_on_top(true);
+        let _ = window.show();
+        let _ = window.set_focus();
+    }
+
+    Ok(label)
 }
 
 fn open_or_focus_window(
